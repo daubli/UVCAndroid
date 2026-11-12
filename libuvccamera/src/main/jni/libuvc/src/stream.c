@@ -295,6 +295,9 @@ static void uvc_fixup_video_ctrl(uvc_device_handle_t *devh,
         ctrl->dwMaxPayloadTransferSize = bandwidth;
     }
 
+    /* the bulk clamp below shortens the transfers, payloads keep the size the device chose */
+    ctrl->dwMaxPayloadTransferSizeDevice = ctrl->dwMaxPayloadTransferSize;
+
 #if defined(__ANDROID__) && !defined(LIBUVC_DISABLE_ANDROID_BULK_PAYLOAD_CLAMP)
     /*
      * Some kernels (often seen on MTK phones) omit or mis-report usbfs caps;
@@ -989,6 +992,48 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
 }
 
 /** @internal
+ * @brief Collect bulk transfers into one payload
+ *
+ * Over bulk, a payload ends with a short transfer or when it reaches the payload size the device
+ * reported. With the Android clamp a transfer is at most 16 KB, while devices such as the
+ * UGREEN 25854 (1de1:f105) send a whole MJPEG frame of about 1 MB as one payload with a single
+ * header. Handing each transfer to _uvc_process_payload on its own would read image data as
+ * payload headers.
+ *
+ * @param short_transfer whether the transfer was shorter than requested
+ */
+static void _uvc_collect_bulk_payload(uvc_stream_handle_t *strmh, uint8_t *data, size_t len,
+                                      int short_transfer) {
+    if (UNLIKELY(!strmh->bulk_payload)) {
+        _uvc_process_payload(strmh, data, len);
+        return;
+    }
+
+    if (strmh->bulk_payload_resync) {
+        /* the end of an overflowed payload, the next transfer starts a new one */
+        if (short_transfer)
+            strmh->bulk_payload_resync = 0;
+        return;
+    }
+
+    if (UNLIKELY(strmh->bulk_payload_bytes + len > strmh->bulk_payload_cap)) {
+        UVC_DEBUG("bulk payload larger than %zu bytes, dropped", strmh->bulk_payload_cap);
+        strmh->bulk_payload_bytes = 0;
+        strmh->bulk_payload_resync = !short_transfer;
+        return;
+    }
+
+    memcpy(strmh->bulk_payload + strmh->bulk_payload_bytes, data, len);
+    strmh->bulk_payload_bytes += len;
+
+    if (short_transfer ||
+        (strmh->bulk_payload_size && strmh->bulk_payload_bytes >= strmh->bulk_payload_size)) {
+        _uvc_process_payload(strmh, strmh->bulk_payload, strmh->bulk_payload_bytes);
+        strmh->bulk_payload_bytes = 0;
+    }
+}
+
+/** @internal
  * @brief Stream transfer callback
  *
  * Processes stream, places frames into buffer, signals listeners
@@ -1004,8 +1049,10 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
     switch (transfer->status) {
         case LIBUSB_TRANSFER_COMPLETED:
             if (transfer->num_iso_packets == 0) {
-                /* This is a bulk mode transfer, so it just has one payload transfer */
-                _uvc_process_payload(strmh, transfer->buffer, transfer->actual_length);
+                /* This is a bulk mode transfer. A payload can be longer than one transfer when the
+                 * transfers are clamped, so collect them until the payload is complete. */
+                _uvc_collect_bulk_payload(strmh, transfer->buffer, transfer->actual_length,
+                                          transfer->actual_length < transfer->length);
             } else {
                 /* This is an isochronous mode transfer, so each packet has a payload transfer */
                 int packet_id;
@@ -1242,6 +1289,14 @@ uvc_error_t uvc_stream_open_ctrl(uvc_device_handle_t *devh, uvc_stream_handle_t 
     strmh->meta_outbuf = malloc(LIBUVC_XFER_META_BUF_SIZE);
     strmh->meta_holdbuf = malloc(LIBUVC_XFER_META_BUF_SIZE);
 
+    /* a payload holds at most one frame and its header */
+    strmh->bulk_payload_size = ctrl->dwMaxPayloadTransferSizeDevice;
+    strmh->bulk_payload_cap = MAX((size_t) ctrl->dwMaxPayloadTransferSizeDevice,
+                                  (size_t) ctrl->dwMaxVideoFrameSize + 4096);
+    strmh->bulk_payload = malloc(strmh->bulk_payload_cap);
+    strmh->bulk_payload_bytes = 0;
+    strmh->bulk_payload_resync = 0;
+
     pthread_mutex_init(&strmh->cb_mutex, NULL);
     pthread_cond_init(&strmh->cb_cond, NULL);
 
@@ -1298,6 +1353,8 @@ uvc_error_t uvc_stream_start(
     strmh->running = 1;
     strmh->seq = 1;
     strmh->fid = 0;
+    strmh->bulk_payload_bytes = 0;
+    strmh->bulk_payload_resync = 0;
     strmh->pts = 0;
     strmh->last_scr = 0;
 
@@ -1755,6 +1812,8 @@ void uvc_stream_close(uvc_stream_handle_t *strmh) {
 
     free(strmh->meta_outbuf);
     free(strmh->meta_holdbuf);
+
+    free(strmh->bulk_payload);
 
     pthread_cond_destroy(&strmh->cb_cond);
     pthread_mutex_destroy(&strmh->cb_mutex);

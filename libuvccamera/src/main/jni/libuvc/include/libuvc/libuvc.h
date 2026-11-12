@@ -537,6 +537,7 @@ typedef struct uvc_stream_ctrl {
     uint8_t bMaxNumberOfRefFramesPlus1;
     uint16_t bmRateControlModes;
     uint64_t bmLayoutPerStream;
+    uint32_t dwMaxPayloadTransferSizeDevice;
 } uvc_stream_ctrl_t;
 
 typedef struct uvc_still_ctrl {

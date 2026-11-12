@@ -329,6 +329,12 @@ struct uvc_stream_handle {
     /* raw metadata buffer if available */
     uint8_t *meta_outbuf, *meta_holdbuf;
     size_t meta_got_bytes, meta_hold_bytes;
+
+    /* bulk streaming: a payload may span several transfers, it is collected here until it is complete */
+    uint8_t *bulk_payload;
+    size_t bulk_payload_bytes, bulk_payload_cap, bulk_payload_size;
+    /* set when a payload overflowed, the transfers are dropped up to the next payload boundary */
+    uint8_t bulk_payload_resync;
 };
 
 /** Handle on an open UVC device
